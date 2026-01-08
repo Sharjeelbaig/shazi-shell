@@ -1,18 +1,16 @@
 import { VirtualFileSystem } from './vfs';
-import { executeWASI } from './wasi';
+import { runtimeManager, ReplSession } from './runtimes';
 
 /**
  * Shell command parser and executor
  * Handles builtin commands and external WASM processes
  */
 
-// Available WASM runtimes and their URLs
-const WASM_BINARIES: Record<string, string> = {
-  // These will be loaded from public/wasm/ when available
-  // python: '/wasm/python.wasm',
-  // node: '/wasm/node.wasm',
-  // lua: '/wasm/lua.wasm',
-};
+export interface ReplState {
+  active: boolean;
+  runtime: string;
+  session: ReplSession | null;
+}
 
 export class Shell {
   private vfs: VirtualFileSystem;
@@ -20,19 +18,68 @@ export class Shell {
   private onOutput: (data: string, isError: boolean) => void;
   private history: string[] = [];
   private historyIndex: number = 0;
+  private replState: ReplState = { active: false, runtime: '', session: null };
+  private onReplStart?: (runtime: string, prompt: string) => void;
+  private onReplEnd?: () => void;
 
   constructor(
     vfs: VirtualFileSystem,
-    onOutput: (data: string, isError: boolean) => void
+    onOutput: (data: string, isError: boolean) => void,
+    onReplStart?: (runtime: string, prompt: string) => void,
+    onReplEnd?: () => void
   ) {
     this.vfs = vfs;
     this.onOutput = onOutput;
+    this.onReplStart = onReplStart;
+    this.onReplEnd = onReplEnd;
     this.env = new Map([
       ['HOME', '/home/user'],
       ['PATH', '/bin'],
       ['USER', 'user'],
       ['PWD', vfs.getCwd()],
     ]);
+  }
+
+  isInRepl(): boolean {
+    return this.replState.active;
+  }
+
+  getReplPrompt(): string {
+    if (this.replState.session) {
+      return this.replState.session.getPrompt();
+    }
+    return '> ';
+  }
+
+  async executeReplInput(input: string): Promise<void> {
+    if (!this.replState.session) return;
+
+    try {
+      const result = await this.replState.session.execute(input);
+
+      if (result.error) {
+        this.writeln(result.error, true);
+      }
+
+      if (result.result !== null) {
+        this.writeln(result.result);
+      }
+
+      // Check if REPL should continue
+      if (!result.continueInput && (input.trim() === 'exit()' || input.trim() === 'quit()' || input.trim() === '.exit' || input.trim() === 'exit')) {
+        this.exitRepl();
+      }
+    } catch (error) {
+      this.writeln(error instanceof Error ? error.message : String(error), true);
+    }
+  }
+
+  private exitRepl(): void {
+    if (this.replState.session) {
+      this.replState.session.destroy();
+    }
+    this.replState = { active: false, runtime: '', session: null };
+    this.onReplEnd?.();
   }
 
   private write(text: string, isError = false): void {
@@ -161,100 +208,175 @@ export class Shell {
         return this.cmdExport(args);
       case 'history':
         return this.cmdHistory();
+      case 'runtimes':
+        return this.cmdRuntimes();
+
+      // Language runtimes
       case 'python':
       case 'python3':
-        return this.cmdPython(args);
+        return this.executeRuntime('python', args);
       case 'node':
-        return this.cmdNode(args);
+      case 'nodejs':
+      case 'js':
+        return this.executeRuntime('node', args);
+      case 'gcc':
+      case 'cc':
+        return this.executeRuntime('gcc', args);
+      case 'g++':
+      case 'cpp':
+        return this.executeRuntime('g++', args);
+      case 'java':
+      case 'javac':
+        return this.executeRuntime('java', args);
+      case 'lua':
+        return this.executeRuntime('lua', args);
+      case 'ruby':
+        return this.executeRuntime('ruby', args);
+      case 'go':
+        return this.executeRuntime('go', args);
+      case 'rust':
+      case 'rustc':
+        return this.executeRuntime('rust', args);
+
       default:
-        // Check if it's a WASM binary
-        if (WASM_BINARIES[cmd]) {
-          return this.executeWasm(cmd, args);
-        }
         throw new Error(`command not found: ${cmd}`);
     }
   }
 
-  // WASM execution
+  // Runtime execution
 
-  private async executeWasm(cmd: string, args: string[]): Promise<number> {
-    const wasmUrl = WASM_BINARIES[cmd];
-    if (!wasmUrl) {
-      this.writeln(`${cmd}: WASM binary not found`, true);
+  private async executeRuntime(runtimeName: string, args: string[]): Promise<number> {
+    const runtime = runtimeManager.getRuntime(runtimeName);
+    if (!runtime) {
+      this.writeln(`${runtimeName}: runtime not available`, true);
       return 127;
     }
 
-    return executeWASI(wasmUrl, {
-      args: [cmd, ...args],
-      env: Object.fromEntries(this.env),
-      vfs: this.vfs,
-      stdout: (data) => this.write(data, false),
-      stderr: (data) => this.write(data, true),
-    });
-  }
+    // Check for -c or -e flag (inline code)
+    if (args.length >= 2 && (args[0] === '-c' || args[0] === '-e')) {
+      const code = args.slice(1).join(' ');
+      return this.runCode(runtime, runtimeName, code);
+    }
 
-  private cmdPython(args: string[]): number {
-    // TODO: Replace with actual Python WASM when available
+    // No arguments - start REPL if supported
     if (args.length === 0) {
+      if (runtime.supportsRepl && runtime.createRepl) {
+        return this.startRepl(runtimeName, runtime);
+      } else {
+        this.writeln(`${runtimeName}: no input file specified`, true);
+        this.writeln(`Usage: ${runtimeName} <file> or ${runtimeName} -c "code"`, true);
+        return 1;
+      }
+    }
+
+    const file = args[0];
+    if (!this.vfs.exists(file)) {
+      this.writeln(`${runtimeName}: ${file}: No such file`, true);
+      return 1;
+    }
+
+    try {
+      const content = new TextDecoder().decode(this.vfs.readFile(file));
+      return this.runCode(runtime, runtimeName, content);
+    } catch (error) {
       this.writeln(
-        'Python WASM runtime not yet loaded.\n' +
-          'To enable Python support:\n' +
-          '1. Download python.wasm from https://github.com/niccokunzmann/pywasm\n' +
-          '2. Place in public/wasm/python.wasm\n' +
-          '3. Uncomment python entry in WASM_BINARIES',
+        `${runtimeName}: ${error instanceof Error ? error.message : 'execution failed'}`,
         true
       );
       return 1;
     }
-
-    // Simple Python simulation for demo purposes
-    const file = args[0];
-    if (file === '-c' && args.length > 1) {
-      // python -c "code"
-      this.writeln('[Python simulation mode]');
-      this.writeln(`Would execute: ${args[1]}`);
-      return 0;
-    }
-
-    if (!this.vfs.exists(file)) {
-      this.writeln(`python: can't open file '${file}': No such file`, true);
-      return 1;
-    }
-
-    this.writeln('[Python WASM not loaded - showing file contents instead]');
-    const content = new TextDecoder().decode(this.vfs.readFile(file));
-    this.writeln(content);
-    return 0;
   }
 
-  private cmdNode(args: string[]): number {
-    // TODO: Replace with actual Node.js WASM when available
-    if (args.length === 0) {
+  private async startRepl(runtimeName: string, runtime: ReturnType<typeof runtimeManager.getRuntime>): Promise<number> {
+    if (!runtime || !runtime.createRepl) return 127;
+
+    try {
+      // Show loading message
+      if (!runtime.isLoaded) {
+        this.writeln(`Loading ${runtime.name}...`);
+      }
+
+      // Create REPL session
+      const session = await runtime.createRepl((text: string, isError: boolean) => {
+        this.write(text, isError);
+      });
+
+      // Show REPL header
+      if (runtimeName === 'python' || runtimeName === 'python3') {
+        this.writeln(`Python 3.11.0 (Pyodide)`);
+        this.writeln(`Type "exit()" or "quit()" to exit.`);
+      } else if (runtimeName === 'node' || runtimeName === 'javascript' || runtimeName === 'js') {
+        this.writeln(`Node.js (QuickJS)`);
+        this.writeln(`Type ".exit" to exit.`);
+      }
+
+      // Set REPL state
+      this.replState = {
+        active: true,
+        runtime: runtimeName,
+        session,
+      };
+
+      // Notify that REPL started
+      this.onReplStart?.(runtimeName, session.getPrompt());
+
+      return 0;
+    } catch (error) {
       this.writeln(
-        'Node.js WASM runtime not yet loaded.\n' +
-          'Node.js WASI support is experimental.\n' +
-          'Consider using Deno WASM or QuickJS instead.',
+        `${runtimeName}: Failed to start REPL: ${error instanceof Error ? error.message : 'unknown error'}`,
         true
       );
       return 1;
     }
+  }
 
-    const file = args[0];
-    if (file === '-e' && args.length > 1) {
-      // node -e "code"
-      this.writeln('[Node.js simulation mode]');
-      this.writeln(`Would execute: ${args[1]}`);
-      return 0;
-    }
+  private async runCode(
+    runtime: ReturnType<typeof runtimeManager.getRuntime>,
+    name: string,
+    code: string
+  ): Promise<number> {
+    if (!runtime) return 127;
 
-    if (!this.vfs.exists(file)) {
-      this.writeln(`node: can't open file '${file}': No such file`, true);
+    try {
+      // Show loading message for runtimes that need to load
+      if (!runtime.isLoaded) {
+        this.writeln(`Loading ${runtime.name}...`);
+      }
+
+      const result = await runtime.execute(code, [], this.vfs);
+
+      if (result.stdout) {
+        this.write(result.stdout);
+      }
+      if (result.stderr) {
+        this.write(result.stderr, true);
+      }
+
+      return result.exitCode;
+    } catch (error) {
+      this.writeln(
+        `${name}: ${error instanceof Error ? error.message : 'execution failed'}`,
+        true
+      );
       return 1;
     }
+  }
 
-    this.writeln('[Node.js WASM not loaded - showing file contents instead]');
-    const content = new TextDecoder().decode(this.vfs.readFile(file));
-    this.writeln(content);
+  private cmdRuntimes(): number {
+    const runtimes = runtimeManager.listRuntimes();
+    this.writeln('Available language runtimes:\n');
+
+    for (const rt of runtimes) {
+      const status = rt.loaded ? '\x1b[32m✓\x1b[0m' : '\x1b[33m○\x1b[0m';
+      this.writeln(`  ${status} ${rt.name.padEnd(10)} - ${rt.description}`);
+    }
+
+    this.writeln('\nUsage: <runtime> <file> or <runtime> -c "code"');
+    this.writeln('       <runtime>            (start REPL for python/node)');
+    this.writeln('Example: python hello.py');
+    this.writeln('Example: node -c "console.log(\'Hello\')"');
+    this.writeln('Example: python              (starts Python REPL)');
+
     return 0;
   }
 
@@ -536,7 +658,7 @@ export class Shell {
 
   private cmdHelp(): number {
     const help = `
-Shazi Shell - Available Commands:
+Shazi Shell - WebAssembly Terminal
 
 File Operations:
   ls [path]           - List directory contents
@@ -558,15 +680,42 @@ Utilities:
   env                 - Show environment variables
   export VAR=val      - Set environment variable
   history             - Show command history
+  runtimes            - List available language runtimes
 
-Language Runtimes (WASM):
-  python <file>       - Run Python script
-  node <file>         - Run JavaScript (Node.js)
+Language Runtimes:
+  python              - Start Python REPL (interactive mode)
+  node                - Start Node.js REPL (interactive mode)
+  python <file>       - Run Python 3 code (Pyodide)
+  node <file>         - Run JavaScript (QuickJS)
+  gcc <file>          - Compile/run C code
+  g++ <file>          - Compile/run C++ code
+  java <file>         - Run Java code
+  lua <file>          - Run Lua code
+  ruby <file>         - Run Ruby code
+  go <file>           - Run Go code
+  rust <file>         - Run Rust code
+
+Inline Execution:
+  python -c "print('Hello')"
+  node -c "console.log('Hello')"
+
+REPL Mode:
+  python              - Start Python REPL
+  >>> print("Hello")  - Execute in Python REPL
+  >>> exit()          - Exit Python REPL
+  
+  node                - Start Node.js REPL
+  > console.log("Hi") - Execute in Node REPL
+  > .exit             - Exit Node REPL
 
 Redirects:
   cmd > file          - Redirect output to file
 
-Note: Language runtimes require WASM binaries in /public/wasm/
+Keyboard Shortcuts:
+  ↑/↓                 - Navigate command history (shell mode)
+  Ctrl+C              - Cancel current input
+  Ctrl+D              - Exit REPL (when input is empty)
+  Ctrl+L              - Clear screen
 `.trim();
 
     this.writeln(help);

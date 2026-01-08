@@ -43,6 +43,14 @@ async function handleMessage(event: MessageEvent<WorkerRequest>): Promise<void> 
         // TODO: Handle terminal resize if needed
         break;
 
+      case 'historyPrev':
+        handleHistoryPrev();
+        break;
+
+      case 'historyNext':
+        handleHistoryNext();
+        break;
+
       default:
         postMessage({
           type: 'error',
@@ -55,6 +63,15 @@ async function handleMessage(event: MessageEvent<WorkerRequest>): Promise<void> 
       message: error instanceof Error ? error.message : 'Unknown error',
     });
   }
+}
+
+function handleReplStart(runtime: string, prompt: string): void {
+  postMessage({ type: 'replActive', runtime });
+  postMessage({ type: 'prompt', prompt, isRepl: true });
+}
+
+function handleReplEnd(): void {
+  postMessage({ type: 'replExit' });
 }
 
 async function handleInit(files?: Record<string, Uint8Array>): Promise<void> {
@@ -77,8 +94,8 @@ async function handleInit(files?: Record<string, Uint8Array>): Promise<void> {
     }
   }
 
-  // Initialize shell
-  shell = new Shell(vfs, handleOutput);
+  // Initialize shell with REPL callbacks
+  shell = new Shell(vfs, handleOutput, handleReplStart, handleReplEnd);
 
   isReady = true;
   postMessage({ type: 'ready' });
@@ -87,6 +104,12 @@ async function handleInit(files?: Record<string, Uint8Array>): Promise<void> {
 async function handleExec(command: string, cwd?: string): Promise<void> {
   if (!isReady) {
     postMessage({ type: 'error', message: 'Worker not initialized' });
+    return;
+  }
+
+  // If we're in REPL mode, route input to REPL
+  if (shell.isInRepl()) {
+    await handleReplInput(command);
     return;
   }
 
@@ -105,9 +128,41 @@ async function handleExec(command: string, cwd?: string): Promise<void> {
   }
 
   // Execute command
+  shell.addToHistory(command);
   const exitCode = await shell.execute(command);
 
+  // If REPL was started, don't send exit code
+  if (shell.isInRepl()) {
+    return;
+  }
+
   postMessage({ type: 'exit', code: exitCode });
+}
+
+async function handleReplInput(input: string): Promise<void> {
+  if (!isReady || !shell || !shell.isInRepl()) {
+    postMessage({ type: 'error', message: 'Not in REPL mode' });
+    return;
+  }
+
+  await shell.executeReplInput(input);
+
+  // Send the new prompt if still in REPL
+  if (shell.isInRepl()) {
+    postMessage({ type: 'prompt', prompt: shell.getReplPrompt(), isRepl: true });
+  }
+}
+
+function handleHistoryPrev(): void {
+  if (!isReady || !shell) return;
+  const cmd = shell.getHistoryPrev();
+  postMessage({ type: 'history', command: cmd ?? '' });
+}
+
+function handleHistoryNext(): void {
+  if (!isReady || !shell) return;
+  const cmd = shell.getHistoryNext();
+  postMessage({ type: 'history', command: cmd ?? '' });
 }
 
 // Register message handler
