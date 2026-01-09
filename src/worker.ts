@@ -145,6 +145,14 @@ async function handleReplInput(input: string): Promise<void> {
     return;
   }
 
+  // If in editor mode, route to editor handler
+  // @ts-ignore - shell may have isInEditor/executeEditorInput
+  if ((shell as any).isInEditor && (shell as any).isInEditor()) {
+    await (shell as any).executeEditorInput(input);
+    // If still in editor, keep prompt as editor prompt (main thread already set it when starting)
+    return;
+  }
+
   await shell.executeReplInput(input);
 
   // Send the new prompt if still in REPL

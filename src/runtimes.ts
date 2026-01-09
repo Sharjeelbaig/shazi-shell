@@ -29,13 +29,15 @@ export interface ReplSession {
   getPrompt(): string;
 }
 
-// Pyodide for Python
+// Pyodide for Python with micropip support
 class PythonRuntime implements LanguageRuntime {
   name = 'Python';
   extensions = ['.py'];
   isLoaded = false;
   supportsRepl = true;
   private pyodide: any = null;
+  private micropip: any = null;
+  private installedPackages: Set<string> = new Set();
 
   async load(): Promise<void> {
     if (this.isLoaded) return;
@@ -47,10 +49,65 @@ class PythonRuntime implements LanguageRuntime {
       this.pyodide = await loadPyodide({
         indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.24.1/full/',
       });
+      
+      // Load micropip for real package installation
+      await this.pyodide.loadPackage('micropip');
+      this.micropip = this.pyodide.pyimport('micropip');
+      
       this.isLoaded = true;
     } catch (error) {
       throw new Error(`Failed to load Python runtime: ${error}`);
     }
+  }
+
+  /**
+   * Install Python packages using micropip (real PyPI packages)
+   */
+  async installPackage(packageName: string, onProgress?: (msg: string) => void): Promise<{ success: boolean; error?: string }> {
+    if (!this.isLoaded) {
+      await this.load();
+    }
+
+    try {
+      onProgress?.(`Collecting ${packageName}...`);
+      await this.micropip.install(packageName);
+      this.installedPackages.add(packageName.split('==')[0].split('[')[0]);
+      onProgress?.(`Successfully installed ${packageName}`);
+      return { success: true };
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      return { success: false, error: errMsg };
+    }
+  }
+
+  /**
+   * List installed packages
+   */
+  async listPackages(): Promise<{ name: string; version: string }[]> {
+    if (!this.isLoaded) {
+      await this.load();
+    }
+
+    try {
+      const result = await this.pyodide.runPythonAsync(`
+import json
+import importlib.metadata
+packages = []
+for dist in importlib.metadata.distributions():
+    packages.append({'name': dist.metadata['Name'], 'version': dist.metadata['Version']})
+json.dumps(packages)
+`);
+      return JSON.parse(result);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Get Pyodide instance for advanced use
+   */
+  getPyodide(): any {
+    return this.pyodide;
   }
 
   async execute(code: string, _args: string[], _vfs: VirtualFileSystem): Promise<RuntimeResult> {
@@ -184,13 +241,14 @@ except Exception as e:
   }
 }
 
-// QuickJS for JavaScript/Node.js
+// QuickJS for JavaScript/Node.js with npm package support
 class JavaScriptRuntime implements LanguageRuntime {
   name = 'JavaScript (QuickJS)';
   extensions = ['.js', '.mjs'];
   isLoaded = false;
   supportsRepl = true;
   private quickjs: any = null;
+  private installedPackages: Map<string, { version: string; code: string }> = new Map();
 
   async load(): Promise<void> {
     if (this.isLoaded) return;
@@ -204,6 +262,56 @@ class JavaScriptRuntime implements LanguageRuntime {
     } catch (error) {
       throw new Error(`Failed to load JavaScript runtime: ${error}`);
     }
+  }
+
+  /**
+   * Install npm packages from esm.sh CDN (real packages!)
+   */
+  async installPackage(packageName: string, version?: string, onProgress?: (msg: string) => void): Promise<{ success: boolean; error?: string }> {
+    try {
+      const pkgSpec = version && version !== 'latest' ? `${packageName}@${version}` : packageName;
+      onProgress?.(`Fetching ${pkgSpec} from esm.sh...`);
+
+      // Fetch package info from esm.sh
+      const response = await fetch(`https://esm.sh/${pkgSpec}`);
+      if (!response.ok) {
+        return { success: false, error: `Package ${pkgSpec} not found on esm.sh` };
+      }
+
+      // Get the actual version from the redirect URL
+      const finalUrl = response.url;
+      const versionMatch = finalUrl.match(/@([^/]+)/);
+      const actualVersion = versionMatch ? versionMatch[1] : version || 'latest';
+
+      // Store the package info
+      this.installedPackages.set(packageName, {
+        version: actualVersion,
+        code: `/* Package ${packageName}@${actualVersion} available via esm.sh */`
+      });
+
+      onProgress?.(`+ ${packageName}@${actualVersion}`);
+      return { success: true };
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      return { success: false, error: errMsg };
+    }
+  }
+
+  /**
+   * List installed packages
+   */
+  listPackages(): { name: string; version: string }[] {
+    return Array.from(this.installedPackages.entries()).map(([name, info]) => ({
+      name,
+      version: info.version
+    }));
+  }
+
+  /**
+   * Get the QuickJS instance
+   */
+  getQuickJS(): any {
+    return this.quickjs;
   }
 
   async execute(code: string, _args: string[], _vfs: VirtualFileSystem): Promise<RuntimeResult> {

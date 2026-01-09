@@ -9,6 +9,8 @@ export function TerminalComponent() {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const workerRef = useRef<Worker | null>(null);
+  const backendWsRef = useRef<WebSocket | null>(null);
+  const modeRef = useRef<'local' | 'backend'>('local');
   const fitAddonRef = useRef<FitAddon | null>(null);
   const inputBufferRef = useRef<string>('');
   const cursorPosRef = useRef<number>(0); // Cursor position within input buffer
@@ -90,7 +92,15 @@ export function TerminalComponent() {
   const handleTerminalInput = useCallback((data: string) => {
     const term = xtermRef.current;
     const worker = workerRef.current;
-    if (!term || !worker) return;
+    if (!term) return;
+
+    if (modeRef.current === 'backend') {
+      const ws = backendWsRef.current;
+      if (!ws || ws.readyState !== ws.OPEN) return;
+      ws.send(JSON.stringify({ type: 'input', data }));
+      return;
+    }
+    if (!worker) return;
 
     // Wait until worker signals ready
     if (!isReadyRef.current) return;
@@ -235,6 +245,72 @@ export function TerminalComponent() {
     fitAddonRef.current = fitAddon;
     xtermRef.current = term;
 
+    const sandboxWsUrl = (import.meta as any).env?.VITE_SANDBOX_WS as string | undefined;
+
+    if (sandboxWsUrl && sandboxWsUrl.trim()) {
+      modeRef.current = 'backend';
+      term.writeln('\x1b[1;36mShazi Shell\x1b[0m');
+      term.writeln('Connecting to self-hosted sandbox...');
+
+      const ws = new WebSocket(sandboxWsUrl);
+      backendWsRef.current = ws;
+
+      ws.onopen = () => {
+        term.writeln(`Connected: ${sandboxWsUrl}`);
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(String(event.data));
+          if (msg?.type === 'ready') return;
+          if (msg?.type === 'output' && typeof msg.data === 'string') {
+            term.write(msg.data);
+            return;
+          }
+          if (msg?.type === 'error' && typeof msg.message === 'string') {
+            term.writeln(`\r\n\x1b[31mSandbox error: ${msg.message}\x1b[0m`);
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      ws.onerror = () => {
+        term.writeln('\r\n\x1b[31mSandbox connection error\x1b[0m');
+      };
+
+      ws.onclose = () => {
+        term.writeln('\r\n\x1b[31mSandbox disconnected\x1b[0m');
+      };
+
+      const inputDisposable = term.onData(handleTerminalInput);
+
+      const handleResize = () => {
+        fitAddon.fit();
+        if (ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        }
+      };
+      window.addEventListener('resize', handleResize);
+
+      const containerEl = terminalRef.current;
+      const handleClick = () => term.focus();
+      containerEl.addEventListener('click', handleClick);
+
+      return () => {
+        window.removeEventListener('resize', handleResize);
+        containerEl.removeEventListener('click', handleClick);
+        inputDisposable.dispose();
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+        term.dispose();
+      };
+    }
+
     const worker = new Worker(new URL('./worker.ts', import.meta.url), {
       type: 'module',
     });
@@ -243,20 +319,22 @@ export function TerminalComponent() {
     worker.onerror = (err) => term.writeln(`\r\n\x1b[31mWorker error: ${err.message}\x1b[0m`);
     worker.postMessage({ type: 'init' } as WorkerRequest);
 
+    term.writeln('\x1b[1;36mShazi Shell\x1b[0m');
+    term.writeln('WebAssembly-based sandboxed terminal');
+    term.writeln('Type "help" for available commands');
+    term.writeln('Type "python" or "node" to start a REPL\r\n');
+
     const inputDisposable = term.onData(handleTerminalInput);
 
-    const handleResize = () => fitAddon.fit();
+    const handleResize = () => {
+      fitAddon.fit();
+    };
     window.addEventListener('resize', handleResize);
 
     // Make container focus the terminal on click
     const containerEl = terminalRef.current;
     const handleClick = () => term.focus();
     containerEl.addEventListener('click', handleClick);
-
-    term.writeln('\x1b[1;36mShazi Shell v0.1.0\x1b[0m');
-    term.writeln('WebAssembly-based sandboxed terminal');
-    term.writeln('Type "help" for available commands');
-    term.writeln('Type "python" or "node" to start a REPL\r\n');
 
     return () => {
       window.removeEventListener('resize', handleResize);
